@@ -55,7 +55,7 @@ type outputFileContextKey struct{}
 var (
 	rootNormalizeProcessProfileArgs = normalizeProcessProfileArgs
 	rootExecuteCommand              = (*cobra.Command).ExecuteC
-	rootNewRootCommandWithEngine    = NewRootCommandWithEngine
+	rootNewRootCommandWithEngine    = newProcessRootCommandWithEngine
 	rootRunPreParse                 = pipeline.RunPreParse
 	rootStopAllStdioClients         = StopAllStdioClients
 	rootLoadPlugins                 = loadPlugins
@@ -148,7 +148,6 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 			}
 		}
 	}()
-
 	restoreArgs := rootNormalizeProcessProfileArgs()
 	defer restoreArgs()
 
@@ -166,9 +165,11 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 
 	timing := NewTimingCollector()
 	defer func() {
+		cleanupStart := time.Now()
 		rootStopAllStdioClients() // Ensure child processes are terminated on exit
 		CloseAuditSink()          // Drain async audit forwards on all exit paths,
 		// including command errors where Cobra skips PersistentPostRunE.
+		timing.Record("business_cleanup", time.Since(cleanupStart))
 		timing.PrintIfEnabled()
 		timing.WriteReportIfEnabled(RawVersion(), SanitizeCommand(os.Args))
 	}()
@@ -191,9 +192,12 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 	// Run PreParse handlers on raw argv before Cobra parses flags.
 	// This corrects model-generated errors like --userId → --user-id
 	// and --limit100 → --limit 100.
-	if err := rootRunPreParse(root, engine); err != nil {
+	preParseStart := time.Now()
+	preParseErr := rootRunPreParse(root, engine)
+	timing.Record("preparse", time.Since(preParseStart))
+	if err := preParseErr; err != nil {
 		err = newPreParseValidationError(err)
-		if interrupted, _ := signalState.outcome(); interrupted != nil {
+		if interrupted, _ := signalState.Outcome(); interrupted != nil {
 			err = interrupted
 		}
 		if target, _, findErr := root.Find(os.Args[1:]); findErr == nil && target != nil && output.UsesUnifiedResult(target) {
@@ -213,7 +217,9 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 	commandPath = telemetryCommandPathForArgs(root, os.Args[1:])
 
 	var err error
+	executeStart := time.Now()
 	executed, err = rootExecuteCommand(root)
+	timing.Record("command_execute", time.Since(executeStart))
 	if executed != nil {
 		commandPath = telemetryCommandPath(executed)
 	}
@@ -230,7 +236,7 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 			fmt.Fprintf(executed.ErrOrStderr(), "Warning: abort output sink after command failure: %v\n", abortErr)
 		}
 	}
-	interrupted, primaryCompletedBeforeSignal := signalState.outcome()
+	interrupted, primaryCompletedBeforeSignal := signalState.Outcome()
 	if interrupted != nil && !primaryCompletedBeforeSignal {
 		if code, attempted, _, _ := output.StoredEmissionState(resultStore); attempted {
 			var publicationErr *outputPublicationError
@@ -255,7 +261,7 @@ func ExecuteWithTelemetry() (exitCode int, commandPath string, errorMessage stri
 		}
 		var publicationErr *outputPublicationError
 		if err == nil || !stderrors.As(err, &publicationErr) {
-			err = interrupted.withCancellationDetail(err)
+			err = interrupted.WithCancellationDetail(err)
 		}
 	}
 	if err != nil {
@@ -779,8 +785,9 @@ func NewRootCommand(ctx ...context.Context) *cobra.Command {
 // used as the Schema assembly source root (RegisterSchemaSourceRoot →
 // ResolveSchemaBuild) and by command-surface policy. Installed plugins and
 // user-defined shortcuts must not change the reviewed Schema surface.
-// declarationOnly skips injectStaticServers / helpers.InitDeps so Schema
-// assembly cannot clobber a live process's ToolCaller or plugin endpoints.
+// declarationOnly skips runtime profile selection, injectStaticServers and
+// helpers.InitDeps so Schema assembly cannot clobber a live process's profile,
+// ToolCaller or plugin endpoints.
 func NewSchemaSourceRootCommand(ctx ...context.Context) *cobra.Command {
 	var rootCtx context.Context
 	if len(ctx) > 0 && ctx[0] != nil {
@@ -796,6 +803,12 @@ func NewRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) 
 	registerSchemaRuntimeDelivery()
 	rootCtx, _ = output.WithResultStore(rootCtx)
 	return newRootCommandWithEngine(rootCtx, engine, true, false)
+}
+
+func newProcessRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine) *cobra.Command {
+	registerSchemaRuntimeDelivery()
+	rootCtx, _ = output.WithResultStore(rootCtx)
+	return newRootCommandWithMode(rootCtx, engine, true, false, false)
 }
 
 func newRootCommandWithEngine(rootCtx context.Context, engine *pipeline.Engine, loadRuntimeExtensions bool, declarationOnly bool) *cobra.Command {
@@ -938,7 +951,9 @@ func newRootCommandWithMode(rootCtx context.Context, engine *pipeline.Engine, lo
 		rootCtx = context.Background()
 	}
 	flags := &GlobalFlags{}
-	authpkg.SetRuntimeProfile(preparseProfileFlag(os.Args[1:]))
+	if !declarationOnly {
+		authpkg.SetRuntimeProfile(preparseProfileFlag(os.Args[1:]))
+	}
 	runner := rootNewCommandRunnerWithFlags(flags)
 	if snapshot, ok := agentMetadataSnapshotFromContext(rootCtx); ok {
 		if runtime, ok := runner.(*runtimeRunner); ok {
@@ -1099,7 +1114,6 @@ func newRootCommandWithMode(rootCtx context.Context, engine *pipeline.Engine, lo
 	}
 
 	bindPersistentFlags(root, flags)
-
 	schemaCmd := cli.NewSchemaCommand()
 	mcpCmd := cli.NewMCPCommand()
 	// Wrap the caller so every MCP tool call's shape is recorded to the local
@@ -1173,8 +1187,11 @@ func newRootCommandWithMode(rootCtx context.Context, engine *pipeline.Engine, lo
 		// Resolve plugins only after the complete distribution command tree is
 		// present, so endpoint and Cobra conflict checks see PAT and edition
 		// commands as well as the open-source base.
+		pluginStart := time.Now()
 		pluginCmds := rootLoadPlugins(root, engine, runner)
+		RecordNestedTiming(rootCtx, "plugin_discovery", time.Since(pluginStart))
 		if len(pluginCmds) > 0 {
+			cli.MarkSchemaCacheRuntimeUncertain()
 			addPluginCommandsSafe(root, pluginCmds)
 		}
 	}
